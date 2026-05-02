@@ -34,7 +34,7 @@ from particle_filter import utils as Utils
 # TF
 # import tf.transformations
 # import tf
-from tf2_ros import TransformBroadcaster
+from tf2_ros import TransformBroadcaster, Buffer, TransformListener
 import tf_transformations
 
 # messages
@@ -168,6 +168,10 @@ class ParticleFiler(Node):
 
         # these topics are for coordinate space things
         self.pub_tf = TransformBroadcaster(self)
+        self.tf_buffer = Buffer()
+        self.tf_listener = TransformListener(self.tf_buffer, self)
+        # cached static transform; looked up once on first publish_tf call
+        self.T_base_laser = None
 
         # these topics are to receive data from the racecar
         self.laser_sub = self.create_subscription(
@@ -236,31 +240,71 @@ class ParticleFiler(Node):
         self.map_initialized = True
 
     def publish_tf(self, pose, stamp=None):
-        ''' Publish a tf for the car. This tells ROS where the car is with respect to the map. '''
-        if stamp == None:
+        ''' Publish map->odom correction so the TF tree is map->odom->base_link->laser. '''
+        if stamp is None:
             stamp = self.get_clock().now().to_msg()
 
+        # Look up base_link->laser once and cache it (it's a static transform)
+        if self.T_base_laser is None:
+            try:
+                tf_bl = self.tf_buffer.lookup_transform(
+                    'base_link', 'laser', rclpy.time.Time())
+                tx = tf_bl.transform.translation
+                rx = tf_bl.transform.rotation
+                self.T_base_laser = tf_transformations.quaternion_matrix(
+                    [rx.x, rx.y, rx.z, rx.w])
+                self.T_base_laser[0, 3] = tx.x
+                self.T_base_laser[1, 3] = tx.y
+                self.T_base_laser[2, 3] = tx.z
+            except Exception:
+                return  # static TF not yet available
+
+        if self.last_pose is None:
+            return
+
+        # Build T[odom, base_link] from the odom pose tracked by odomCB
+        ox, oy, ot = self.last_pose
+        cos_o, sin_o = np.cos(ot), np.sin(ot)
+        T_odom_base = np.array([
+            [cos_o, -sin_o, 0.0, ox],
+            [sin_o,  cos_o, 0.0, oy],
+            [0.0,    0.0,   1.0, 0.0],
+            [0.0,    0.0,   0.0, 1.0]
+        ])
+
+        # T[map, laser] from inferred pose
+        cos_t, sin_t = np.cos(pose[2]), np.sin(pose[2])
+        T_map_laser = np.array([
+            [cos_t, -sin_t, 0.0, pose[0]],
+            [sin_t,  cos_t, 0.0, pose[1]],
+            [0.0,    0.0,   1.0, 0.0],
+            [0.0,    0.0,   0.0, 1.0]
+        ])
+
+        # T[odom, laser] = T[odom, base_link] @ T[base_link, laser]  (no TF lookup)
+        T_odom_laser = T_odom_base @ self.T_base_laser
+
+        # T[map, odom] = T[map, laser] @ inv(T[odom, laser])
+        T_map_odom = T_map_laser @ np.linalg.inv(T_odom_laser)
+        q = tf_transformations.quaternion_from_matrix(T_map_odom)
+
         t = TransformStamped()
-        # header
         t.header.stamp = stamp
-        t.header.frame_id = '/map'
-        t.child_frame_id = '/laser'
-        # translation
-        t.transform.translation.x = pose[0]
-        t.transform.translation.y = pose[1]
-        t.transform.translation.z = 0.0
-        q = tf_transformations.quaternion_from_euler(0., 0., pose[2])
-        # rotation
+        t.header.frame_id = 'map'
+        t.child_frame_id = 'odom'
+        t.transform.translation.x = T_map_odom[0, 3]
+        t.transform.translation.y = T_map_odom[1, 3]
+        t.transform.translation.z = T_map_odom[2, 3]
         t.transform.rotation.x = q[0]
         t.transform.rotation.y = q[1]
         t.transform.rotation.z = q[2]
         t.transform.rotation.w = q[3]
         self.pub_tf.sendTransform(t)
-        # also publish odometry to facilitate getting the localization pose
+
         if self.PUBLISH_ODOM:
             odom = Odometry()
             odom.header.stamp = self.get_clock().now().to_msg()
-            odom.header.frame_id = '/map'
+            odom.header.frame_id = 'map'
             odom.pose.pose.position.x = pose[0]
             odom.pose.pose.position.y = pose[1]
             odom.pose.pose.orientation = Utils.angle_to_quaternion(pose[2])
@@ -268,8 +312,6 @@ class ParticleFiler(Node):
             odom.pose.covariance[:cov_mat.shape[0]] = cov_mat
             odom.twist.twist.linear.x = self.current_speed
             self.odom_pub.publish(odom)
-        
-        return
 
     def visualize(self):
         '''
@@ -359,12 +401,24 @@ class ParticleFiler(Node):
         self.current_speed = msg.twist.twist.linear.x
 
         if isinstance(self.last_pose, np.ndarray):
-            # changes in x,y,theta in local coordinate system of the car
+            # Compute delta at the laser frame so the motion model is consistent
+            # with the sensor model (which ray-casts from particle positions = laser positions).
+            # laser_pos = base_pos + R(yaw) @ [bx, by]
+            if self.T_base_laser is not None:
+                bx, by = self.T_base_laser[0, 3], self.T_base_laser[1, 3]
+                cos_c, sin_c = np.cos(orientation), np.sin(orientation)
+                cos_p, sin_p = np.cos(self.last_pose[2]), np.sin(self.last_pose[2])
+                laser_curr = position + np.array([cos_c * bx - sin_c * by,
+                                                  sin_c * bx + cos_c * by])
+                laser_prev = self.last_pose[0:2] + np.array([cos_p * bx - sin_p * by,
+                                                              sin_p * bx + cos_p * by])
+                delta = np.array([laser_curr - laser_prev]).transpose()
+            else:
+                delta = np.array([position - self.last_pose[0:2]]).transpose()
+
             rot = Utils.rotation_matrix(-self.last_pose[2])
-            delta = np.array([position - self.last_pose[0:2]]).transpose()
-            local_delta = (rot*delta).transpose()
-            
-            self.odometry_data = np.array([local_delta[0,0], local_delta[0,1], orientation - self.last_pose[2]])
+            local_delta = (rot * delta).transpose()
+            self.odometry_data = np.array([local_delta[0, 0], local_delta[0, 1], orientation - self.last_pose[2]])
             self.last_pose = pose
             self.last_stamp = msg.header.stamp
             self.odom_initialized = True
@@ -387,14 +441,29 @@ class ParticleFiler(Node):
     def initialize_particles_pose(self, pose):
         '''
         Initialize particles in the general region of the provided pose.
+        /initialpose is published at the base_link position in the map frame.
+        Particles represent the laser frame, so apply T[base_link, laser] to convert.
         '''
-        self.get_logger().info('SETTING POSE')
-        self.get_logger().info(str([pose.position.x, pose.position.y]))
+        theta = Utils.quaternion_to_angle(pose.orientation)
+
+        # Convert base_link pose to laser pose using cached static transform
+        if self.T_base_laser is not None:
+            bx = self.T_base_laser[0, 3]
+            by = self.T_base_laser[1, 3]
+            cos_t, sin_t = np.cos(theta), np.sin(theta)
+            lx = pose.position.x + cos_t * bx - sin_t * by
+            ly = pose.position.y + sin_t * bx + cos_t * by
+            laser_yaw = tf_transformations.euler_from_matrix(self.T_base_laser)[2]
+            ltheta = theta + laser_yaw
+        else:
+            lx, ly, ltheta = pose.position.x, pose.position.y, theta
+
+        self.get_logger().info('SETTING POSE (laser frame): ' + str([lx, ly]))
         self.state_lock.acquire()
         self.weights = np.ones(self.MAX_PARTICLES) / float(self.MAX_PARTICLES)
-        self.particles[:,0] = pose.position.x + np.random.normal(loc=0.0,scale=0.5,size=self.MAX_PARTICLES)
-        self.particles[:,1] = pose.position.y + np.random.normal(loc=0.0,scale=0.5,size=self.MAX_PARTICLES)
-        self.particles[:,2] = Utils.quaternion_to_angle(pose.orientation) + np.random.normal(loc=0.0,scale=0.4,size=self.MAX_PARTICLES)
+        self.particles[:,0] = lx + np.random.normal(loc=0.0, scale=0.5, size=self.MAX_PARTICLES)
+        self.particles[:,1] = ly + np.random.normal(loc=0.0, scale=0.5, size=self.MAX_PARTICLES)
+        self.particles[:,2] = ltheta + np.random.normal(loc=0.0, scale=0.4, size=self.MAX_PARTICLES)
         self.state_lock.release()
 
     def initialize_global(self):
