@@ -46,7 +46,7 @@ def generate_launch_description():
     # nodes
     pf_node = Node(
         package='particle_filter',
-        executable='particle_filter',
+        executable='particle_filter_fixed',
         name='particle_filter',
         parameters=[LaunchConfiguration('localize_config')]
     )
