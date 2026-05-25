@@ -1,5 +1,5 @@
 image: houston_main.pgm
-mode: trinary
+# mode: trinary
 resolution: 0.05
 origin: [-17, -4.21, 0]
 negate: 0
