@@ -98,6 +98,11 @@ class ParticleFiler(Node):
         # current weighted mean with this Gaussian std-dev. Set 0 to disable.
         self.declare_parameter('region_swap_xy_stddev', 0.10)   # m
         self.declare_parameter('region_swap_theta_stddev', 0.05) # rad
+        # When the two maps are NEAR-IDENTICAL (only a few pixels differ near
+        # the bridge), tightening collapses a healthy particle cloud onto its
+        # mean and causes visible jitter. Default OFF for this branch since
+        # the only thing changing across regions is a tiny patch of walls.
+        self.declare_parameter('tighten_particles_on_swap', False)
 
         # parameters
         self.ANGLE_STEP           = self.get_parameter('angle_step').value
@@ -132,6 +137,7 @@ class ParticleFiler(Node):
         self.REGION_TOPIC        = str(self.get_parameter('region_topic').value or '/region/active')
         self.REGION_SWAP_XY_STD  = float(self.get_parameter('region_swap_xy_stddev').value)
         self.REGION_SWAP_TH_STD  = float(self.get_parameter('region_swap_theta_stddev').value)
+        self.TIGHTEN_ON_SWAP     = bool(self.get_parameter('tighten_particles_on_swap').value)
         # Bridge state. region_states maps name -> {map_info, range_method, permissible_region}.
         # Active region's references live in self.range_method / self.permissible_region / self.map_info.
         self.region_states = {}
@@ -418,9 +424,14 @@ class ParticleFiler(Node):
                     self.range_method.set_sensor_model(self.sensor_model_table)
                 except Exception as exc:
                     self.get_logger().warn(f"region swap: set_sensor_model failed: {exc}")
-            # Tighten particles around the current weighted mean.
-            self._tighten_particles_around_current_estimate()
-        self.get_logger().warn(f"[PF REGION] {old} -> {name} | particles tightened")
+            # Tighten particles around the current weighted mean — skipped
+            # when maps are near-identical (default) to avoid jittering a
+            # healthy particle cloud onto its mean for no localization gain.
+            tightened_msg = "tighten skipped"
+            if self.TIGHTEN_ON_SWAP:
+                self._tighten_particles_around_current_estimate()
+                tightened_msg = "particles tightened"
+        self.get_logger().warn(f"[PF REGION] {old} -> {name} | {tightened_msg}")
 
     def _tighten_particles_around_current_estimate(self):
         '''Resample particles from a Gaussian around the current weighted mean,

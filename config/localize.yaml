@@ -38,12 +38,17 @@ particle_filter:
     # PF resolves it against `<particle_filter install share>/maps/`. The
     # second form is what you want for portability between dev and Jetson:
     #     over_map_yaml: 'ICRA_Masters/over_map.yaml'   # ← preferred
-    over_map_yaml: ''                # TODO: e.g. 'ICRA_Masters/over_map.yaml'
+    over_map_yaml: 'under_map_bridged_TOP.yaml'   # bridge / over-route variant
     region_topic: '/region/active'
-    region_swap_xy_stddev: 0.10      # m — particle cloud tightening on swap
+    # When the two maps differ by only a few pixels (bridge wall patch),
+    # leave tighten OFF — it collapses a healthy cloud to its mean and would
+    # visibly jitter the pose estimate. The other stddevs only apply when
+    # tighten is true (e.g. if you ever swap between very different maps).
+    tighten_particles_on_swap: false
+    region_swap_xy_stddev: 0.10      # m
     region_swap_theta_stddev: 0.05   # rad
 
 map_server:
   ros__parameters:
     # assuming map file is in particle_filter/maps
-    map: 'ICRA_1'
+    map: 'under_map_bridged_BOTTOM'   # base / under-route variant
