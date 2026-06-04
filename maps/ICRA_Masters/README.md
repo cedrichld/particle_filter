@@ -14,11 +14,14 @@ map_server:
     map: 'ICRA_Masters/under_map'
 ```
 
-For the OVER map, edit `particle_filter/config/localize.yaml`:
+For the OVER map, edit `particle_filter/config/localize.yaml`. PF resolves
+this either as an absolute path (leading `/`) or relative to the
+`particle_filter` install share's `maps/` dir. **Use the relative form for
+portability between dev (cedric) and Jetson (nvidia):**
 ```
 particle_filter:
   ros__parameters:
-    over_map_yaml: '/abs/path/.../share/particle_filter/maps/ICRA_Masters/over_map.yaml'
+    over_map_yaml: 'ICRA_Masters/over_map.yaml'    # ← preferred
 ```
 
 See `mppi_bringup/maps/ICRA_Masters/README.md` for the SLAM workflow.

@@ -124,8 +124,11 @@ class ParticleFiler(Node):
         self.MOTION_DISPERSION_Y     = self.get_parameter('motion_dispersion_y').value
         self.MOTION_DISPERSION_THETA = self.get_parameter('motion_dispersion_theta').value
 
-        # Bridge dual-map params
-        self.OVER_MAP_YAML       = str(self.get_parameter('over_map_yaml').value or '').strip()
+        # Bridge dual-map params. Resolve relative paths (no leading '/')
+        # against this package's share/maps dir so the same yaml works on
+        # dev (cedric) and Jetson (nvidia) without hardcoded absolute paths.
+        raw_over = str(self.get_parameter('over_map_yaml').value or '').strip()
+        self.OVER_MAP_YAML = self._resolve_pf_map_path(raw_over)
         self.REGION_TOPIC        = str(self.get_parameter('region_topic').value or '/region/active')
         self.REGION_SWAP_XY_STD  = float(self.get_parameter('region_swap_xy_stddev').value)
         self.REGION_SWAP_TH_STD  = float(self.get_parameter('region_swap_theta_stddev').value)
@@ -263,6 +266,26 @@ class ParticleFiler(Node):
         # Active region defaults to UNDER on boot.
         self._activate_region('under')
         self.map_initialized = True
+
+    def _resolve_pf_map_path(self, path_str):
+        '''Accept either an absolute path or a path relative to this package's
+        share/maps directory. Empty string passes through unchanged so the
+        dual-map code can detect "no over map configured" via truthiness.'''
+        if not path_str:
+            return ''
+        if os.path.isabs(path_str):
+            return path_str
+        # Resolve relative to <particle_filter share>/maps/
+        try:
+            from ament_index_python.packages import get_package_share_directory
+            base = os.path.join(get_package_share_directory('particle_filter'), 'maps')
+            return os.path.join(base, path_str)
+        except Exception as exc:
+            self.get_logger().warn(
+                f"could not resolve relative over_map_yaml '{path_str}': {exc}; "
+                f"using raw string"
+            )
+            return path_str
 
     def _build_region_state_from_msg(self, map_msg, label='under'):
         '''Build (range_method, permissible_region, map_info) for one region

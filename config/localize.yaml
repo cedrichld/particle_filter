@@ -33,7 +33,12 @@ particle_filter:
     # When over_map_yaml is non-empty, PF pre-loads a SECOND map at startup and
     # swaps to it on /region/active messages from the region_manager node.
     # IMPORTANT: both maps must share the same resolution (e.g. 0.05 m/px).
-    over_map_yaml: ''                # absolute path to the over-bridge map yaml
+    #
+    # PATH RESOLUTION: a leading '/' makes this an absolute path; otherwise
+    # PF resolves it against `<particle_filter install share>/maps/`. The
+    # second form is what you want for portability between dev and Jetson:
+    #     over_map_yaml: 'ICRA_Masters/over_map.yaml'   # ← preferred
+    over_map_yaml: ''                # TODO: e.g. 'ICRA_Masters/over_map.yaml'
     region_topic: '/region/active'
     region_swap_xy_stddev: 0.10      # m — particle cloud tightening on swap
     region_swap_theta_stddev: 0.05   # rad
