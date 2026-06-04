@@ -29,6 +29,14 @@ particle_filter:
     motion_dispersion_theta: 0.25
     # sensor model variant, variant 2 good for rmgpu, 3 doesn't work for rmgpu
     rangelib_variant: 2
+    # ── Bridge / dual-map support ──
+    # When over_map_yaml is non-empty, PF pre-loads a SECOND map at startup and
+    # swaps to it on /region/active messages from the region_manager node.
+    # IMPORTANT: both maps must share the same resolution (e.g. 0.05 m/px).
+    over_map_yaml: ''                # absolute path to the over-bridge map yaml
+    region_topic: '/region/active'
+    region_swap_xy_stddev: 0.10      # m — particle cloud tightening on swap
+    region_swap_theta_stddev: 0.05   # rad
 
 map_server:
   ros__parameters:

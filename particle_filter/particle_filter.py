@@ -21,6 +21,7 @@
 # SOFTWARE.
 
 # ros2 python
+import os
 import rclpy
 from rclpy.node import Node
 
@@ -86,6 +87,18 @@ class ParticleFiler(Node):
         self.declare_parameter('scan_topic')
         self.declare_parameter('odometry_topic')
 
+        # ── Bridge: dual-region support ─────────────────────────────────
+        # When over_map_yaml is non-empty, build a SECOND map state at boot
+        # (range_method + permissible_region + map_info) and swap which is
+        # active on /region/active messages. Sensor model table is shared
+        # (assumes both maps have the same resolution).
+        self.declare_parameter('over_map_yaml', '')
+        self.declare_parameter('region_topic', '/region/active')
+        # Particle "tighten" on swap: re-spread N particles around the
+        # current weighted mean with this Gaussian std-dev. Set 0 to disable.
+        self.declare_parameter('region_swap_xy_stddev', 0.10)   # m
+        self.declare_parameter('region_swap_theta_stddev', 0.05) # rad
+
         # parameters
         self.ANGLE_STEP           = self.get_parameter('angle_step').value
         self.MAX_PARTICLES        = self.get_parameter('max_particles').value
@@ -110,6 +123,16 @@ class ParticleFiler(Node):
         self.MOTION_DISPERSION_X     = self.get_parameter('motion_dispersion_x').value
         self.MOTION_DISPERSION_Y     = self.get_parameter('motion_dispersion_y').value
         self.MOTION_DISPERSION_THETA = self.get_parameter('motion_dispersion_theta').value
+
+        # Bridge dual-map params
+        self.OVER_MAP_YAML       = str(self.get_parameter('over_map_yaml').value or '').strip()
+        self.REGION_TOPIC        = str(self.get_parameter('region_topic').value or '/region/active')
+        self.REGION_SWAP_XY_STD  = float(self.get_parameter('region_swap_xy_stddev').value)
+        self.REGION_SWAP_TH_STD  = float(self.get_parameter('region_swap_theta_stddev').value)
+        # Bridge state. region_states maps name -> {map_info, range_method, permissible_region}.
+        # Active region's references live in self.range_method / self.permissible_region / self.map_info.
+        self.region_states = {}
+        self.active_region = 'under'
         
         # various data containers used in the MCL algorithm
         self.MAX_RANGE_PX = None
@@ -190,50 +213,210 @@ class ParticleFiler(Node):
             '/clicked_point',
             self.clicked_pose,
             1)
+        # Bridge: subscribe to region switches only when the OVER map is loaded.
+        if 'over' in self.region_states:
+            from rclpy.qos import QoSProfile, QoSDurabilityPolicy, QoSReliabilityPolicy
+            latched_qos = QoSProfile(
+                depth=1,
+                durability=QoSDurabilityPolicy.TRANSIENT_LOCAL,
+                reliability=QoSReliabilityPolicy.RELIABLE,
+            )
+            self.region_sub = self.create_subscription(
+                String, self.REGION_TOPIC, self._on_region_active, latched_qos)
+            self.get_logger().info(f'BRIDGE: subscribed to {self.REGION_TOPIC}')
 
         self.get_logger().info('Finished initializing, waiting on messages...')
 
     def get_omap(self):
         '''
-        Fetch the occupancy grid map from the map_server instance, and initialize the correct
-        RangeLibc method. Also stores a matrix which indicates the permissible region of the map
+        Fetch the occupancy grid map from the map_server (UNDER region) and
+        build its range-libc / permissible-region state. If over_map_yaml is
+        configured, ALSO load that map directly from disk and pre-build its
+        state so /region/active can swap between them at zero cost.
         '''
-
         while not self.map_client.wait_for_service(timeout_sec=1.0):
             self.get_logger().info('Get map service not available, waiting...')
         req = GetMap.Request()
         future = self.map_client.call_async(req)
         rclpy.spin_until_future_complete(self, future)
-        map_msg = future.result().map
-        self.map_info = map_msg.info
+        under_state = self._build_region_state_from_msg(future.result().map, label='under')
+        self.region_states['under'] = under_state
 
-        oMap = range_libc.PyOMap(map_msg)
-        self.MAX_RANGE_PX = int(self.MAX_RANGE_METERS / self.map_info.resolution)
+        if self.OVER_MAP_YAML:
+            try:
+                over_msg = self._occupancy_grid_from_yaml(self.OVER_MAP_YAML)
+                over_state = self._build_region_state_from_msg(over_msg, label='over')
+                self.region_states['over'] = over_state
+                # Both maps must share resolution so the sensor_model_table
+                # (sized by MAX_RANGE_PX = max_range_m / resolution) applies
+                # to both range_methods.
+                if abs(over_state['map_info'].resolution - under_state['map_info'].resolution) > 1e-6:
+                    self.get_logger().error(
+                        f"BRIDGE: under res={under_state['map_info'].resolution:.4f} "
+                        f"vs over res={over_state['map_info'].resolution:.4f} — "
+                        f"sensor model table won't match for over region. "
+                        f"SLAM both maps at the same resolution."
+                    )
+            except Exception as exc:
+                self.get_logger().error(f"BRIDGE: failed to load over map '{self.OVER_MAP_YAML}': {exc}")
 
-        # initialize range method
-        self.get_logger().info('Initializing range method: ' + self.WHICH_RM)
-        if self.WHICH_RM == 'bl':
-            self.range_method = range_libc.PyBresenhamsLine(oMap, self.MAX_RANGE_PX)
-        elif 'cddt' in self.WHICH_RM:
-            self.range_method = range_libc.PyCDDTCast(oMap, self.MAX_RANGE_PX, self.THETA_DISCRETIZATION)
-            if self.WHICH_RM == 'pcddt':
-                self.get_logger().info('Pruning...')
-                self.range_method.prune()
-        elif self.WHICH_RM == 'rm':
-            self.range_method = range_libc.PyRayMarching(oMap, self.MAX_RANGE_PX)
-        elif self.WHICH_RM == 'rmgpu':
-            self.range_method = range_libc.PyRayMarchingGPU(oMap, self.MAX_RANGE_PX)
-        elif self.WHICH_RM == 'glt':
-            self.range_method = range_libc.PyGiantLUTCast(oMap, self.MAX_RANGE_PX, self.THETA_DISCRETIZATION)
-        self.get_logger().info('Done loading map')
-
-         # 0: permissible, -1: unmapped, 100: blocked
-        array_255 = np.array(map_msg.data).reshape((map_msg.info.height, map_msg.info.width))
-
-        # 0: not permissible, 1: permissible
-        self.permissible_region = np.zeros_like(array_255, dtype=bool)
-        self.permissible_region[array_255==0] = 1
+        # Active region defaults to UNDER on boot.
+        self._activate_region('under')
         self.map_initialized = True
+
+    def _build_region_state_from_msg(self, map_msg, label='under'):
+        '''Build (range_method, permissible_region, map_info) for one region
+        from a nav_msgs/OccupancyGrid message. Independent of the active
+        region — caller stores the dict in self.region_states.'''
+        self.get_logger().info(
+            f"[{label}] Building range method '{self.WHICH_RM}' for map "
+            f"({map_msg.info.width}x{map_msg.info.height} @ "
+            f"{map_msg.info.resolution:.4f} m/px)"
+        )
+        oMap = range_libc.PyOMap(map_msg)
+        max_range_px = int(self.MAX_RANGE_METERS / map_msg.info.resolution)
+        if self.WHICH_RM == 'bl':
+            range_method = range_libc.PyBresenhamsLine(oMap, max_range_px)
+        elif 'cddt' in self.WHICH_RM:
+            range_method = range_libc.PyCDDTCast(oMap, max_range_px, self.THETA_DISCRETIZATION)
+            if self.WHICH_RM == 'pcddt':
+                self.get_logger().info(f'[{label}] Pruning CDDT...')
+                range_method.prune()
+        elif self.WHICH_RM == 'rm':
+            range_method = range_libc.PyRayMarching(oMap, max_range_px)
+        elif self.WHICH_RM == 'rmgpu':
+            range_method = range_libc.PyRayMarchingGPU(oMap, max_range_px)
+        elif self.WHICH_RM == 'glt':
+            range_method = range_libc.PyGiantLUTCast(oMap, max_range_px, self.THETA_DISCRETIZATION)
+        else:
+            raise ValueError(f"unknown range_method '{self.WHICH_RM}'")
+
+        array_255 = np.array(map_msg.data).reshape((map_msg.info.height, map_msg.info.width))
+        permissible = np.zeros_like(array_255, dtype=bool)
+        permissible[array_255 == 0] = 1
+        return {
+            'map_info':     map_msg.info,
+            'range_method': range_method,
+            'permissible_region': permissible,
+            'max_range_px': max_range_px,
+        }
+
+    def _activate_region(self, name):
+        '''Swap the active region's pointers. O(1) — no compute, no recompile.
+        Sensor model table (set via range_method.set_sensor_model) is applied
+        per-range_method in _precompute_or_attach_sensor_model.'''
+        state = self.region_states.get(name)
+        if state is None:
+            self.get_logger().error(f"_activate_region: region '{name}' not loaded")
+            return
+        self.active_region = name
+        self.map_info = state['map_info']
+        self.range_method = state['range_method']
+        self.permissible_region = state['permissible_region']
+        self.MAX_RANGE_PX = state['max_range_px']
+
+    def _occupancy_grid_from_yaml(self, yaml_path):
+        '''Construct a nav_msgs/OccupancyGrid from a ROS map yaml + image on
+        disk (PGM/PNG/BMP). Mirrors the conventions map_server uses for
+        thresholding (occupied >= 0.65*255 -> 100, free <= 0.196*255 -> 0,
+        else -1). Origin is read from yaml.'''
+        import yaml as _yaml
+        from PIL import Image
+        from nav_msgs.msg import OccupancyGrid
+        with open(yaml_path, 'r') as f:
+            meta = _yaml.safe_load(f)
+        img_field = meta.get('image')
+        if not img_field:
+            raise ValueError(f"yaml has no 'image' field: {yaml_path}")
+        img_path = img_field
+        if not os.path.isabs(img_path):
+            img_path = os.path.join(os.path.dirname(yaml_path), img_path)
+        if not os.path.isfile(img_path):
+            # Try with both .pgm and .png extensions if the listed one is missing
+            stem = os.path.splitext(img_path)[0]
+            for ext in ('.pgm', '.png', '.bmp'):
+                cand = stem + ext
+                if os.path.isfile(cand):
+                    img_path = cand
+                    break
+        img = Image.open(img_path).convert('L')
+        arr = np.array(img, dtype=np.uint8)
+        # ROS map_server convention: rows flipped (y up in world = top of image).
+        # Some yaml files use negate=1, but for SLAM maps default 0 is standard:
+        # white(255)=free, black(0)=occupied. We invert to map_server semantics:
+        # occupancy = (255 - pixel) / 255.
+        negate = int(meta.get('negate', 0))
+        occ_thresh = float(meta.get('occupied_thresh', 0.65))
+        free_thresh = float(meta.get('free_thresh', 0.196))
+        pixels = arr.astype(np.float32) / 255.0
+        if negate == 0:
+            occ = 1.0 - pixels  # white=free=0, black=occupied=1
+        else:
+            occ = pixels
+        # Convert to OccupancyGrid data: 0=free, 100=occupied, -1=unknown
+        data = np.full(occ.shape, -1, dtype=np.int8)
+        data[occ <= free_thresh] = 0
+        data[occ >= occ_thresh] = 100
+        # Flip vertically so y axis points up (ROS convention)
+        data = np.flipud(data)
+
+        msg = OccupancyGrid()
+        msg.info.resolution = float(meta.get('resolution', 0.05))
+        msg.info.width = int(arr.shape[1])
+        msg.info.height = int(arr.shape[0])
+        origin = meta.get('origin', [0.0, 0.0, 0.0])
+        msg.info.origin.position.x = float(origin[0])
+        msg.info.origin.position.y = float(origin[1])
+        msg.info.origin.position.z = 0.0
+        msg.info.origin.orientation.w = 1.0
+        msg.data = data.flatten().tolist()
+        return msg
+
+    # ── Bridge: region switch handler ────────────────────────────────────
+    def _on_region_active(self, msg):
+        '''Subscriber callback for /region/active. Swap to the requested
+        region's map state and tighten the particle cloud around the current
+        weighted mean so PF converges quickly on the new map.'''
+        if 'over' not in self.region_states:
+            return  # single-map build — ignore
+        name = str(msg.data).strip().lower()
+        if name not in self.region_states:
+            return
+        if name == self.active_region:
+            return
+        with self.state_lock:
+            old = self.active_region
+            self._activate_region(name)
+            # Re-attach sensor model table to the new range_method (the table
+            # was sized at boot under the under-map resolution; both maps share
+            # resolution per the assertion in get_omap).
+            if getattr(self, 'sensor_model_table', None) is not None and self.RANGELIB_VAR > 0:
+                try:
+                    self.range_method.set_sensor_model(self.sensor_model_table)
+                except Exception as exc:
+                    self.get_logger().warn(f"region swap: set_sensor_model failed: {exc}")
+            # Tighten particles around the current weighted mean.
+            self._tighten_particles_around_current_estimate()
+        self.get_logger().warn(f"[PF REGION] {old} -> {name} | particles tightened")
+
+    def _tighten_particles_around_current_estimate(self):
+        '''Resample particles from a Gaussian around the current weighted mean,
+        with small spread. Called immediately after a map swap so the particle
+        cloud collapses fast onto whatever pose matches the new map best.'''
+        if self.particles is None or self.weights is None:
+            return
+        if not np.isfinite(self.weights).all() or self.weights.sum() <= 0.0:
+            mean = self.particles.mean(axis=0)
+        else:
+            w = self.weights / self.weights.sum()
+            mean = np.average(self.particles, axis=0, weights=w)
+        n = self.MAX_PARTICLES
+        xy_std = max(0.0, self.REGION_SWAP_XY_STD)
+        th_std = max(0.0, self.REGION_SWAP_TH_STD)
+        self.particles[:, 0] = mean[0] + np.random.normal(0.0, xy_std, size=n)
+        self.particles[:, 1] = mean[1] + np.random.normal(0.0, xy_std, size=n)
+        self.particles[:, 2] = mean[2] + np.random.normal(0.0, th_std, size=n)
+        self.weights[:] = 1.0 / float(n)
 
     def publish_tf(self, pose, stamp=None):
         ''' Publish a tf for the car. This tells ROS where the car is with respect to the map. '''
@@ -468,7 +651,15 @@ class ParticleFiler(Node):
 
         # upload the sensor model to RangeLib for ultra fast resolution
         if self.RANGELIB_VAR > 0:
-            self.range_method.set_sensor_model(self.sensor_model_table)
+            # Apply to BOTH region range_methods so a /region/active swap is
+            # zero-cost. (For single-map runs region_states has only one entry.)
+            for region_name, state in self.region_states.items():
+                try:
+                    state['range_method'].set_sensor_model(self.sensor_model_table)
+                except Exception as exc:
+                    self.get_logger().warn(
+                        f"set_sensor_model failed for region '{region_name}': {exc}"
+                    )
 
     def motion_model(self, proposal_dist, action):
         '''
