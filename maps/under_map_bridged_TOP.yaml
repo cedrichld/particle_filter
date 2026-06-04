@@ -1,5 +1,4 @@
-image: under_map_bridged_TOP
-.pgm
+image: under_map_bridged_TOP.pgm
 mode: trinary
 resolution: 0.05
 origin: [-6.13, -5.78, 0]
