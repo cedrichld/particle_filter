@@ -424,6 +424,12 @@ class ParticleFiler(Node):
                     self.range_method.set_sensor_model(self.sensor_model_table)
                 except Exception as exc:
                     self.get_logger().warn(f"region swap: set_sensor_model failed: {exc}")
+            # CRITICAL: reset weights to uniform on swap. The old weights came
+            # from scan-likelihood evaluations against the OLD map; if we keep
+            # them, the very next MCL step may normalize a near-zero sum and
+            # produce NaN weights → crash. Uniform weights let the next scan
+            # under the NEW map re-weight cleanly.
+            self.weights[:] = 1.0 / float(self.MAX_PARTICLES)
             # Tighten particles around the current weighted mean — skipped
             # when maps are near-identical (default) to avoid jittering a
             # healthy particle cloud onto its mean for no localization gain.
@@ -431,7 +437,7 @@ class ParticleFiler(Node):
             if self.TIGHTEN_ON_SWAP:
                 self._tighten_particles_around_current_estimate()
                 tightened_msg = "particles tightened"
-        self.get_logger().warn(f"[PF REGION] {old} -> {name} | {tightened_msg}")
+        self.get_logger().warn(f"[PF REGION] {old} -> {name} | weights reset uniform, {tightened_msg}")
 
     def _tighten_particles_around_current_estimate(self):
         '''Resample particles from a Gaussian around the current weighted mean,
@@ -838,6 +844,15 @@ class ParticleFiler(Node):
         '''
         if self.SHOW_FINE_TIMING:
             t = time.time()
+        # Defensive: if weights went non-finite or sum-zero (e.g. all particles
+        # got effectively zero likelihood after a region swap on a bad scan),
+        # fall back to uniform so np.random.choice doesn't crash on NaN.
+        w_sum = float(self.weights.sum())
+        if (not np.isfinite(self.weights).all()) or w_sum <= 0.0 or not np.isfinite(w_sum):
+            self.get_logger().warn(
+                f"PF weights invalid (sum={w_sum}, finite={np.isfinite(self.weights).all()}); "
+                f"resetting to uniform")
+            self.weights[:] = 1.0 / float(self.MAX_PARTICLES)
         # draw the proposal distribution from the old particles
         proposal_indices = np.random.choice(self.particle_indices, self.MAX_PARTICLES, p=self.weights)
         proposal_distribution = self.particles[proposal_indices,:]
